@@ -1,0 +1,117 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+body {
+  width: 700px;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  color: #eee;
+  background: #1a1f2b;
+}
+#container {
+  padding: 20px 30px 30px 30px;
+}
+/* 头部 */
+.head-box {
+  text-align: center;
+  margin: 20px 0 30px 0;
+}
+.head-box .title {
+  font-size: 42px;
+  font-weight: bold;
+  color: #d3bc8e;
+  text-shadow: 0 2px 6px rgba(0,0,0,0.5);
+  letter-spacing: 2px;
+}
+.head-box .label {
+  font-size: 16px;
+  color: #8899aa;
+  margin-top: 8px;
+}
+/* 分组卡片 */
+.cont-box {
+  border-radius: 12px;
+  margin-bottom: 16px;
+  overflow: hidden;
+  background: rgba(34, 41, 51, 0.75);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.help-group {
+  font-size: 17px;
+  font-weight: bold;
+  color: #d3bc8e;
+  padding: 12px 16px 8px 16px;
+  background: rgba(34, 41, 51, 0.5);
+  border-bottom: 1px solid rgba(211, 188, 142, 0.15);
+}
+/* 表格 */
+.help-table {
+  width: 100%;
+}
+.help-table .tr {
+  display: flex;
+}
+.help-table .td {
+  flex: 1;
+  padding: 10px 16px 10px 16px;
+  line-height: 22px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.help-table .tr:last-child .td {
+  border-bottom: none;
+}
+.help-table .tr:nth-child(odd) {
+  background: rgba(255,255,255,0.02);
+}
+.help-table .tr:nth-child(even) {
+  background: rgba(255,255,255,0.04);
+}
+.help-title {
+  display: block;
+  color: #d3bc8e;
+  font-size: 15px;
+  font-weight: bold;
+  font-family: "Consolas", "Courier New", "Microsoft YaHei", monospace;
+}
+.help-desc {
+  display: block;
+  color: #8899aa;
+  font-size: 13px;
+  margin-top: 2px;
+}
+/* 技巧 */
+.tips-box {
+  border-radius: 12px;
+  margin-top: 24px;
+  padding: 16px;
+  background: rgba(34, 41, 51, 0.6);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.tips-title {
+  font-size: 16px;
+  font-weight: bold;
+  color: #d3bc8e;
+  margin-bottom: 10px;
+}
+.tips-list {
+  display: flex;
+  flex-wrap: wrap;
+}
+.tips-item {
+  width: 50%;
+  font-size: 13px;
+  color: #8899aa;
+  padding: 4px 0;
+}
+.tips-item::before {
+  content: "· ";
+  color: #d3bc8e;
+}
+/* 底部 */
+.copyright {
+  text-align: center;
+  font-size: 12px;
+  color: #556;
+  margin-top: 20px;
+}
