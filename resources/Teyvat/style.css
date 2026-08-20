@@ -602,10 +602,6 @@ div.Actions > div.title::before {
     content: "操作手法";
 }
 
-div.Actions > div.title::after {
-    content: "默认手法可能并非最优，如需自定义操作手法请使用微信小程序";
-}
-
 div.Actions > div.act {
     max-width: 98%;
     padding: 0 1% 1%;
@@ -629,6 +625,87 @@ div.Actions > div.act > div {
     align-items: center;
     justify-content: center;
     position: relative;
+}
+
+/* 操作手法行：左操作手法（收窄）+ 右最高伤害面板 */
+div.ActionRow {
+    width: 920px;
+    position: relative;
+    top: 15px;
+    left: 20px;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 15px;
+    margin-block-end: 20px;
+}
+
+div.ActionRow > div.Actions {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    top: 0;
+    left: 0;
+    margin-block-end: unset;
+}
+
+div.ActionRow > div.MaxDamage {
+    width: 270px;
+    min-height: 90px;
+    border-radius: 15px;
+    color: #ffffff;
+    background-color: #332e3ed6;
+    box-shadow: 0px 15px 15px rgb(0 0 0 / 40%);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-evenly;
+    padding: 10px 0;
+}
+
+div.ActionRow > div.MaxDamage > div.head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+}
+
+div.ActionRow > div.MaxDamage > div.head > div.label {
+    font-size: 25px;
+    font-weight: 700;
+}
+
+div.ActionRow > div.MaxDamage > div.head > div.label::before {
+    content: "最高伤害";
+}
+
+div.ActionRow > div.MaxDamage > div.head > img.face {
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    background-color: var(--artiBg);
+    object-fit: cover;
+}
+
+div.ActionRow > div.MaxDamage > div.value {
+    font-family: "PanelNumFont";
+    font-size: 44px;
+    font-weight: 700;
+    text-align: center;
+    text-shadow: 0 0 3px #d3bc8e, 2px 2px 4px rgb(0 0 0 / 70%);
+    color: rgba(235, 205, 124, 0.95);
+    padding: 0 10px;
+}
+
+div.ActionRow > div.MaxDamage > div.value::after {
+    content: "单段暴击伤害";
+    display: block;
+    font-family: "PanelFont";
+    font-size: 15px;
+    font-weight: 400;
+    color: var(--ambrLight);
+    opacity: 0.68;
+    text-shadow: none;
 }
 
 ul.Damages > li,

@@ -2,7 +2,7 @@
 import { getUrlJson } from '../models/getUrlJson.js'
 import plugin from '../../../lib/plugins/plugin.js'
 import fs from 'fs'
-import { team } from '../models/getTeam.js'
+import { team, parseRoleChanges } from '../models/getTeam.js'
 import _ from 'lodash'
 import MysApi from '../models/GetATUID.js'
 import { Character } from '../../miao-plugin/models/index.js'
@@ -585,6 +585,18 @@ export class TeamDamage extends plugin {
         ]
       },
       {
+        group: '🔹 角色信息变更（换命座/武器/圣遗物）',
+        list: [
+          { title: '#队伍伤害 胡桃,钟离,夜兰换六命换若水换精5换4饰金,莫娜', desc: '给夜兰换6命+若水+精5+4饰金之梦' },
+          { title: '换六命/五命/.../零命', desc: '变更命座' },
+          { title: '换精5/精1/...', desc: '变更武器精炼（精5=精炼5阶）' },
+          { title: '换若水/换护摩/...', desc: '变更武器（支持常见武器名）' },
+          { title: '换4饰金/换4魔女/换4绝缘/...', desc: '变更圣遗物套装（可简写：饰金=饰金之梦）' },
+          { title: '换a10/换e10/换q10', desc: '变更天赋等级（a=普攻/e=战技/q=爆发）' },
+          { title: '换90/换80', desc: '变更角色等级' }
+        ]
+      },
+      {
         group: '🔹 配队简称管理',
         list: [
           { title: '#td添加配队简称 龙芙希万 = 那维莱特,芙宁娜,希诺宁,万叶', desc: '一步式保存配队简称（推荐）' },
@@ -614,6 +626,7 @@ export class TeamDamage extends plugin {
       '手法动作：A/A1/A2/E/Q/重击/长E/跳跃/闪避',
       '角色名+动作前缀绑定：钟离长e, 行秋q,e,e',
       '同角色后续动作无需重复写角色名',
+      '换命座/武器/圣遗物：夜兰换六命换若水换精5换4饰金',
       '配队简称存本地文件，重启/搬家不丢',
       '命令中 #td 前缀可省略'
     ]
@@ -684,9 +697,34 @@ export class TeamDamage extends plugin {
       logger.info(`[TD-plugin]配队简称替换：原『${roleList}』→ 展开后『${aliasExpandedText}』${aliasCombo ? '，命中手法（简称绑定）=' + aliasCombo : ''}`)
     }
 
+    // 🔥【换XX角色变更解析】：按中文逗号/英文逗号先拆成角色条目，检测含「换」的条目拆出角色名+变更参数
+    const rawEntries = aliasExpandedText.split(/[，,]/).filter(Boolean)
+    const cleanRoleNames = []
+    const roleChangesArr = []
+    for (const entry of rawEntries) {
+      const trimmed = entry.trim()
+      if (trimmed.includes('换')) {
+        const parts = trimmed.split('换')
+        const roleName = parts[0].trim()
+        const changeTokens = parts.slice(1).map(s => s.trim()).filter(Boolean)
+        if (roleName) {
+          cleanRoleNames.push(roleName)
+          const changes = parseRoleChanges(changeTokens, roleName)
+          roleChangesArr.push(changes)
+          if (changes) {
+            logger.info(`[TD-plugin]角色变更[${roleName}]：${JSON.stringify(changes)}`)
+          }
+        }
+      } else {
+        cleanRoleNames.push(trimmed)
+        roleChangesArr.push(null)
+      }
+    }
+    const cleanRoleList = cleanRoleNames.join('，')
+
     // 🔥【切分：角色名 vs 手法原文】：按分隔符拆 token，从前往后贪婪取"能命中角色"的 1~4 个，剩的就当手法原文
     const splitter = /[\s,，、。\-|]+/
-    const allTokens = aliasExpandedText.trim().split(splitter).filter(Boolean)
+    const allTokens = cleanRoleList.trim().split(splitter).filter(Boolean)
     const roleTokens = []
     let comboText = ''
     // 用 miao-plugin Character.get 验证是否是合法角色名（跟 team() 里判断角色一致）
@@ -747,7 +785,7 @@ export class TeamDamage extends plugin {
     // 把角色桶长度 padding 到跟 orderedNames 一样（避免 team 里 custom JSON 组装索引错位）
     while (customRoleActionsFinal.length < orderedNames.length) customRoleActionsFinal.push([])
 
-    await team(e, _.compact(roleTokens), uid, detail, customComboFinal, customRoleActionsFinal)
+    await team(e, _.compact(roleTokens), uid, detail, customComboFinal, customRoleActionsFinal, roleChangesArr)
     return true
   }
 

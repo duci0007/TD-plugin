@@ -237,13 +237,24 @@
 <!--        </div>-->
 <!--        {{/each}}-->
 <!--    </div>-->
-    <div class="Actions">
-        <div class="title"></div>
-        <div class="act">
-            {{each data["actions"] action}}
-            <div>{{ action }}</div>
-            {{/each}}
+    <div class="ActionRow">
+        <div class="Actions">
+            <div class="title"></div>
+            <div class="act">
+                {{each data["actions"] action}}
+                <div>{{ action }}</div>
+                {{/each}}
+            </div>
         </div>
+        {{ if data["maxDamage"] }}
+        <div class="MaxDamage">
+            <div class="head">
+                <div class="label"></div>
+                <img class="face" src="{{ data['maxDamage']['face'] }}">
+            </div>
+            <div class="value">{{ data['maxDamage']['value'] }}</div>
+        </div>
+        {{/if}}
     </div>
     <ul class="Buffs">
         <li class="title"></li>

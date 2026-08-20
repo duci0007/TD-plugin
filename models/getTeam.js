@@ -1,7 +1,7 @@
 import fetch from 'node-fetch'
 import _ from 'lodash'
-import { Format } from '../../miao-plugin/components/index.js'
-import { Character, Player, Artifact } from '../../miao-plugin/models/index.js'
+import { Format, Meta } from '../../miao-plugin/components/index.js'
+import { Character, Player, Artifact, Weapon, ArtifactSet } from '../../miao-plugin/models/index.js'
 import getServer from './getServer.js'
 import simpleTeamDamageRes from './simpleTeamDamageRes.js'
 import puppeteer from '../../../lib/puppeteer/puppeteer.js'
@@ -65,6 +65,158 @@ const elemIdMap = {
 const elemCnMap = { pyro: '火', hydro: '水', cryo: '冰', electro: '雷', anemo: '风', geo: '岩', dendro: '草' }
 
 /**
+ * 解析「换XX换YY」格式的角色变更参数（借用 miao-plugin 的 Meta/Weapon/ArtifactSet）
+ * @param {string[]} changeTokens 换分隔后的 token 数组（不含角色名），如 ["六命","若水","精5","4饰金"]
+ * @returns {object|null} 变更对象，无有效变更时返回 null
+ */
+export function parseRoleChanges (changeTokens, roleName = '') {
+  if (!Array.isArray(changeTokens) || changeTokens.length === 0) return null
+  const changes = {}
+  let hasChange = false
+  const constMap = { 六: 6, 五: 5, 四: 4, 三: 3, 二: 2, 一: 1, 零: 0, 满: 6 }
+
+  // 构建圣遗物别名映射（借用 miao-plugin Meta.getAlias）
+  let asMap = []
+  let asAliasMap = {}
+  try {
+    asMap = Meta.getAlias('gs', 'artiSet') || []
+    for (const alias of asMap) {
+      const set = ArtifactSet.get(alias, 'gs')
+      if (set && set.name) {
+        asAliasMap[alias] = set.name
+      }
+    }
+  } catch (_) {}
+
+  for (const raw of changeTokens) {
+    const t = String(raw || '').trim()
+    if (!t) continue
+
+    // 命座：六命/五命/.../零命/满命（参考 miao-plugin）
+    const constMatch = t.match(/^([0-6六五四三二一零满])(命)$/)
+    if (constMatch) {
+      const val = constMatch[1]
+      changes.role_class_change = String(/^\d$/.test(val) ? parseInt(val) : (constMap[val] || 0))
+      hasChange = true
+      continue
+    }
+
+    // 精炼：精5/精1/...（参考 miao-plugin 的 affix 匹配）——值直接为精炼等级（1~5）
+    const refMatch = t.match(/^精(?:炼)?([1-5一二三四五满])$/)
+    if (refMatch) {
+      const affixMap = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 满: 5 }
+      const val = refMatch[1]
+      changes.weapon_class_change = String(affixMap[val] || parseInt(val) || 1)
+      hasChange = true
+      continue
+    }
+
+    // 天赋：a10/e10/q10 / A10/E10/Q10（参考 miao-plugin 天赋解析）
+    const talentMatch = t.match(/^([aeqAEQ])([1-9]|1[0-5])$/)
+    if (talentMatch) {
+      const key = talentMatch[1].toLowerCase()
+      const val = parseInt(talentMatch[2])
+      if (key === 'a') changes.ability1_change = val
+      else if (key === 'e') changes.ability2_change = val
+      else if (key === 'q') changes.ability3_change = val
+      hasChange = true
+      continue
+    }
+
+    // 天赋：天赋101313 / 天赋10 13 13 / 天赋10,13,13（1:1 参考 miao-plugin 天赋解析）
+    const talentFullMatch = t.match(/^天赋((?:1[0-5]|[1-9]))[,\s，、]?((?:1[0-5]|[1-9]))[,\s，、]?((?:1[0-5]|[1-9]))$/)
+    if (talentFullMatch) {
+      changes.ability1_change = parseInt(talentFullMatch[1])
+      changes.ability2_change = parseInt(talentFullMatch[2])
+      changes.ability3_change = parseInt(talentFullMatch[3])
+      hasChange = true
+      continue
+    }
+
+    // 圣遗物：4饰金 / 饰金4 / 饰金 / 魔女套4（借用 miao-plugin Meta 别名）
+    let artiName = null
+    let artiCount = 4
+    const artiNumFirst = t.match(/^(\d)(.+)$/)
+    const artiNumLast = t.match(/^(.+?)(\d)$/)
+    const checkAlias = (name) => {
+      if (!name) return null
+      // 先直接查别名
+      if (asAliasMap[name]) return asAliasMap[name]
+      // 去掉"套"再查
+      const noSuffix = name.replace(/套$/, '')
+      if (asAliasMap[noSuffix]) return asAliasMap[noSuffix]
+      // 直接用 ArtifactSet.get 查
+      try {
+        const set = ArtifactSet.get(name, 'gs')
+        if (set && set.name) return set.name
+      } catch (_) {}
+      return null
+    }
+    if (artiNumFirst) {
+      const full = checkAlias(artiNumFirst[2])
+      if (full) { artiCount = parseInt(artiNumFirst[1]); artiName = full }
+    }
+    if (!artiName && artiNumLast) {
+      const full = checkAlias(artiNumLast[1])
+      if (full) { artiCount = parseInt(artiNumLast[2]); artiName = full }
+    }
+    if (!artiName) {
+      const full = checkAlias(t)
+      if (full) { artiName = full }
+    }
+    if (artiName) {
+      changes.artifacts_change = `${artiName}${artiCount}`
+      hasChange = true
+      continue
+    }
+
+    // 角色等级：20-90（参考 miao-plugin 等级解析）
+    const lvlMatch = t.match(/^(?:等级)?([2-9][0-9])(?:级)?$/)
+    if (lvlMatch) {
+      const lvl = parseInt(lvlMatch[1])
+      if (lvl >= 20 && lvl <= 90) {
+        changes.role_level_change = String(lvl)
+        hasChange = true
+        continue
+      }
+    }
+
+    // 武器名（含精炼/等级前缀 + 专武简称，1:1 参考 miao-plugin ProfileChange 的武器匹配）
+    try {
+      const wRet = /^(?:等?级?([1-9][0-9])?级?)?\s*(?:([1-5一二三四五满])(精炼?|叠影?)|(精炼?|叠影?)([1-5一二三四五]))?\s*(?:等?级?([1-9][0-9])?级?)?\s*(.*)$/.exec(t)
+      if (wRet && wRet[7]) {
+        let weaponName = String(wRet[7] || '').trim()
+        if (/专武/.test(weaponName)) {
+          const charName = weaponName.replace(/专武/g, '') || String(roleName || '').trim()
+          const char = Character.get(charName, 'gs')
+          weaponName = char ? `${char.name}专武` : weaponName
+        }
+        const weapon = Weapon.get(weaponName, 'gs')
+        if (weapon && weapon.name) {
+          changes.weapon_change = weapon.name
+          const affixRaw = wRet[2] || wRet[5]
+          if (affixRaw) {
+            const affixMap = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 满: 5 }
+            changes.weapon_class_change = String(affixMap[affixRaw] || parseInt(affixRaw) || 1)
+          }
+          const wLevel = parseInt(wRet[1] || wRet[6] || '') || 0
+          if (wLevel >= 20 && wLevel <= 90) changes.weapon_level_change = String(wLevel)
+          hasChange = true
+          continue
+        }
+      }
+    } catch (_) {}
+
+    // 兜底：直接当武器名
+    if (t) {
+      changes.weapon_change = t
+      hasChange = true
+    }
+  }
+  return hasChange ? changes : null
+}
+
+/**
  * 将 combo_intro 格式的字符串转换为 API 所需数组：[role_no, code, code, ...]
  * 输入: "芙宁娜E,Q,那维莱特E,枫原万叶长E,Q,那维莱特Q,重击,重击,重击"
  * 输出: [2, "e", "q", 1, "e", 4, "e", "q", 1, "q", "zj", "zj", "zj"]
@@ -116,7 +268,7 @@ function buildComboArray (comboStr, teamar) {
   return arr
 }
 
-export async function team (e, teamlist, uid, detail, customComboStr, roleActionsArr) {
+export async function team (e, teamlist, uid, detail, customComboStr, roleActionsArr, roleChanges) {
   if (teamlist.length === 1) {
     const res = await ReturnTeamArr(teamlist[0])
     if (res && res[0]) {
@@ -191,6 +343,49 @@ export async function team (e, teamlist, uid, detail, customComboStr, roleAction
       rolesData[char] = m_roleData
       weaponsData[char] = m_roleData.weapon
       let m_TeyvatData = await covProfileTeyvatData(profile, { uidStr, serverCn })
+      // 应用角色变更（换六命/换若水/换精5/换4饰金等）
+      const idx = role_data.length
+      const changeObj = (Array.isArray(roleChanges) && idx < roleChanges.length) ? roleChanges[idx] : null
+      if (changeObj) {
+        // 🔥 把解析出的「_change」字段映射到请求体实际字段名，否则 Object.assign 只会加上无用键、真实数据不被覆盖
+        const changeMap = {}
+        if (changeObj.role_class_change != null) changeMap.role_class = changeObj.role_class_change
+        if (changeObj.role_level_change != null) changeMap.level = changeObj.role_level_change
+        if (changeObj.weapon_change != null) changeMap.weapon = changeObj.weapon_change
+        if (changeObj.weapon_level_change != null) changeMap.weapon_level = parseInt(changeObj.weapon_level_change) || 90
+        if (changeObj.weapon_class_change != null) changeMap.weapon_class = `精炼${changeObj.weapon_class_change}阶`
+        if (changeObj.artifacts_change != null) changeMap.artifacts = changeObj.artifacts_change
+        if (changeObj.ability1_change != null) changeMap.ability1 = changeObj.ability1_change
+        if (changeObj.ability2_change != null) changeMap.ability2 = changeObj.ability2_change
+        if (changeObj.ability3_change != null) changeMap.ability3 = changeObj.ability3_change
+        Object.assign(m_TeyvatData, changeMap)
+        // 🔥 同步更新面板显示：武器/圣遗物替换后图标、精炼、等级、星级也要跟着换，否则图上仍显示原面板数据
+        if (changeObj.weapon_change != null && weaponsData[char]) {
+          try {
+            const w = Weapon.get(changeObj.weapon_change, 'gs')
+            if (w && w.name) {
+              weaponsData[char].name = w.name
+              weaponsData[char].rarity = w.star
+              weaponsData[char].icon = w.img
+              weaponsData[char].weaponPath = `${w.type}/${w.name}`
+            }
+          } catch (_) {}
+        }
+        // 精炼/武器等级独立于武器替换生效（单独「换精5」也要更新 R 标）
+        if (weaponsData[char]) {
+          if (changeObj.weapon_class_change != null) {
+            weaponsData[char].affix = parseInt(changeObj.weapon_class_change) || 1
+          }
+          if (changeObj.weapon_level_change != null) {
+            weaponsData[char].level = parseInt(changeObj.weapon_level_change) || weaponsData[char].level
+          }
+        }
+        if (changeObj.artifacts_change != null) {
+          const am = /^(.+?)([24])$/.exec(String(changeObj.artifacts_change))
+          if (am) m_roleData.relicSet = { [am[1]]: parseInt(am[2]) }
+        }
+        logger.info(`[TD-plugin]角色变更[${char}]：${JSON.stringify(changeMap)}`)
+      }
       role_data.push(m_TeyvatData)
     }
   } catch (error) {

@@ -187,6 +187,8 @@ async function simpleTeamDamageRes (raw, rolesData) {
   })
 
   let damages = []
+  let maxDamageStep = null
+  let maxDamageVal = -Infinity
   for (let step of (raw.advice || [])) {
     if (!step.content) {
       logger.error(`奇怪的伤害：${step}`)
@@ -208,6 +210,32 @@ async function simpleTeamDamageRes (raw, rolesData) {
       }
     }
     damages.push([t.replace('s', ''), _.toUpper(a), ...d])
+    // 最高伤害：d[0] 为暴击伤害，取全流程最大的一条
+    const critVal = parseFloat(d[0])
+    if (Number.isFinite(critVal) && critVal > maxDamageVal) {
+      maxDamageVal = critVal
+      maxDamageStep = step
+    }
+  }
+
+  // 解析最高伤害归属角色：detail.0 形如 "当前钟离面板"，兜底用 content 动作串前缀匹配角色名
+  let maxDamage = null
+  if (maxDamageStep) {
+    let char = ''
+    try {
+      const d0 = maxDamageStep.detail && (maxDamageStep.detail['0'] || maxDamageStep.detail[0])
+      const cm = /当前(.+?)面板/.exec(String(d0 || ''))
+      if (cm) char = cm[1]
+    } catch (e) {}
+    if (!char) {
+      const s = String(maxDamageStep.content).split(' ')[1] || ''
+      for (const r of (raw.role_list || [])) {
+        if (r.role && s.startsWith(r.role)) { char = r.role; break }
+      }
+    }
+    if (char && avatars[char] && avatars[char].face) {
+      maxDamage = { char, value: Math.round(maxDamageVal), face: avatars[char].face }
+    }
   }
 
   // buff 字段名可能是 buff / buffs / buff_intro，且不一定是数组
@@ -263,7 +291,8 @@ async function simpleTeamDamageRes (raw, rolesData) {
     avatars,
     actions: (raw.combo_intro || '').split(',').filter(Boolean),
     damages,
-    buffs
+    buffs,
+    maxDamage
   }
 }
 
