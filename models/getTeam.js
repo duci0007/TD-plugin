@@ -226,7 +226,7 @@ function buildComboArray (comboStr, teamar) {
   const actionToCode = {
     A: 'a', A1: 'a1', A2: 'a2', A3: 'a3', A4: 'a4', A5: 'a5',
     重击: 'zj', ZJ: 'zj',
-    Q: 'q', E: 'e', 长E: 'e',
+    Q: 'q', E: 'e', 短E: 'e', 长E: 'e2',
     跳跃: 'k', 跳: 'k',
     闪避: 's', 闪: 's',
     冲刺: 'dash', 下落攻击: 'fall'
@@ -237,6 +237,18 @@ function buildComboArray (comboStr, teamar) {
     const n = v?.name
     if (n) nameToNo.set(n, i + 1)
   })
+  /** 🔥 弓系角色重击代码是 gzj（抓包确认：夜兰 skill_code="gzj"），其他武器 zj */
+  const getActionCode = (tok, roleNo) => {
+    // 等待动作：等0.1/等待0.1s/等0.5秒 → ["==", 0.1]（抓包确认：custom_combo=[4,["==",0.1]] → combo_intro="莫娜等待0.1s"）
+    const waitMatch = /^等(?:待)?(\d+(?:\.\d+)?)(?:s|秒)?$/.exec(String(tok).trim())
+    if (waitMatch) return ['==', parseFloat(waitMatch[1])]
+    let code = actionToCode[tok] || tok.toLowerCase()
+    if (code === 'zj') {
+      const charObj = roleNo > 0 ? teamar[roleNo - 1] : null
+      if (charObj?.weaponType === 'bow') code = 'gzj'
+    }
+    return code
+  }
   const tokens = comboStr.split(',').filter(Boolean)
   const arr = []
   let currentRoleNo = -1
@@ -252,8 +264,7 @@ function buildComboArray (comboStr, teamar) {
         }
         const actionTok = tok.slice(name.length)
         if (actionTok) {
-          const code = actionToCode[actionTok] || actionTok.toLowerCase()
-          arr.push(code)
+          arr.push(getActionCode(actionTok, currentRoleNo))
         }
         matched = true
         break
@@ -261,8 +272,7 @@ function buildComboArray (comboStr, teamar) {
     }
     if (!matched) {
       // 纯动作（同角色后续）
-      const code = actionToCode[tok] || tok.toLowerCase()
-      arr.push(code)
+      arr.push(getActionCode(tok, currentRoleNo))
     }
   }
   return arr

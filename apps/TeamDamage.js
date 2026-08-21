@@ -194,6 +194,9 @@ function normalizeActionToken (tok) {
     '闪': '闪避', '躲开': '闪避'
   }
   if (aliasMap[raw]) return aliasMap[raw]
+  // 等待：等0.1 / 等待0.1 / 等0.1s / 等待0.5秒 → 等0.1s
+  const waitMatch = raw.match(/^等(?:待)?(\d+(?:\.\d+)?)(?:s|秒)?$/)
+  if (waitMatch) return `等${waitMatch[1]}s`
   // 长E / 长e → 长E
   if (/^长[eE]$/.test(raw)) return '长E'
   if (/^(长|长按)[eE]$/.test(raw)) return '长E'
@@ -581,7 +584,7 @@ export class TeamDamage extends plugin {
         group: '🔹 自定义手法（inline 临时写）',
         list: [
           { title: '#队伍伤害 胡桃,钟离,行秋,万叶 钟离长e,行秋q,e,e...', desc: '角色名+动作前缀绑定，同角色后续动作无需重复写角色名' },
-          { title: '动作支持：A/A1/A2/E/Q/重击/长E/跳跃/闪避', desc: '大小写通用，逗号/空格/顿号分隔均可' }
+          { title: '动作支持：A/A1/A2/E/Q/长E/重击/跳跃/闪避/等待', desc: '大小写通用，逗号/空格/顿号分隔均可' }
         ]
       },
       {
@@ -623,7 +626,8 @@ export class TeamDamage extends plugin {
     ]
     const tips = [
       '角色名之间用逗号/空格/顿号分隔均可',
-      '手法动作：A/A1/A2/E/Q/重击/长E/跳跃/闪避',
+      '手法动作：A/A1/A2/E/Q/长E/重击/跳跃/闪避/等待',
+      '等待写法：等0.1 或 等待0.5s（部分角色支持）',
       '角色名+动作前缀绑定：钟离长e, 行秋q,e,e',
       '同角色后续动作无需重复写角色名',
       '换命座/武器/圣遗物：夜兰换六命换若水换精5换4饰金',
