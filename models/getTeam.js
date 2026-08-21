@@ -317,16 +317,13 @@ export async function team (e, teamlist, uid, detail, customComboStr, roleAction
   const serMap = { cn_gf01: '天空岛', cn_qd01: '世界树', os_usa: '美服', os_euro: '欧服', os_asia: '亚服', os_cht: '台港澳服' }
   const serverCn = serMap[server] || server || '天空岛'
   const uidStr = String(uid || '')
-  // 1:1 对齐 FanSky 原版 transToTeyvatRequest L12-15 顶层结构：
-  //   原版只有 { uid, role_data }；当 UID 第1位不是 '1' 且不是 '2' 时，才额外加 server（中文名）
+  // 🔥 对齐小程序抓包：顶层 server 始终传 ID（cn_gf01/cn_qd01/os_asia...），不是中文名；
+  //   中文名（天空岛/世界树）只出现在 role_data 每个条目的 server 字段里
   //   传了自定义手法时：
   //     custom_combo = 纯动作时序字符串（剥掉所有角色名前缀）
   //     custom = 接口返回标准结构 JSONArray（4 角色 skill[]，每个 skill 带 combo_num/repeat）
   //     has_custom_change = true（显式告诉接口：这是自定义手法）
-  let TiwateBody = { uid: uidStr, role_data: [] }
-  if (uidStr && uidStr[0] !== '1' && uidStr[0] !== '2') {
-    TiwateBody.server = serverCn
-  }
+  let TiwateBody = { uid: uidStr, server, role_data: [] }
   const _comboClean = String(customComboStr || '').replace(/[\s,，、]+/g, ',').replace(/,+/g, ',').replace(/^,+|,+$/g, '')
   const hasCustomCombo = !!_comboClean
   let rolesData = {}
