@@ -701,45 +701,24 @@ export class TeamDamage extends plugin {
       logger.info(`[TD-plugin]配队简称替换：原『${roleList}』→ 展开后『${aliasExpandedText}』${aliasCombo ? '，命中手法（简称绑定）=' + aliasCombo : ''}`)
     }
 
-    // 🔥【换XX角色变更解析】：按中文逗号/英文逗号先拆成角色条目，检测含「换」的条目拆出角色名+变更参数
-    const rawEntries = aliasExpandedText.split(/[，,]/).filter(Boolean)
-    const cleanRoleNames = []
-    const roleChangesArr = []
-    for (const entry of rawEntries) {
-      const trimmed = entry.trim()
-      if (trimmed.includes('换')) {
-        const parts = trimmed.split('换')
-        const roleName = parts[0].trim()
-        const changeTokens = parts.slice(1).map(s => s.trim()).filter(Boolean)
-        if (roleName) {
-          cleanRoleNames.push(roleName)
-          const changes = parseRoleChanges(changeTokens, roleName)
-          roleChangesArr.push(changes)
-          if (changes) {
-            logger.info(`[TD-plugin]角色变更[${roleName}]：${JSON.stringify(changes)}`)
-          }
-        }
-      } else {
-        cleanRoleNames.push(trimmed)
-        roleChangesArr.push(null)
-      }
-    }
-    const cleanRoleList = cleanRoleNames.join('，')
-
-    // 🔥【切分：角色名 vs 手法原文】：按分隔符拆 token，从前往后贪婪取"能命中角色"的 1~4 个，剩的就当手法原文
+    // 🔥【切分：角色条目 vs 手法原文】：按分隔符拆 token，从前往后贪婪取"能命中角色"的 1~4 个，剩的当手法原文
+    //   角色条目可带「换XX」变更后缀（如火神换狼末），验角色名时先剥掉换后面的部分
+    //   🔥 必须先切分再解析换XX：若先按逗号拆整段，「希诺宁换勇者 班尼特e」会把空格后的手法首token吞进武器名
     const splitter = /[\s,，、。\-|]+/
-    const allTokens = cleanRoleList.trim().split(splitter).filter(Boolean)
+    const allTokens = aliasExpandedText.trim().split(splitter).filter(Boolean)
     const roleTokens = []
+    const roleEntryTokens = [] // 原始角色条目（含换XX后缀，供变更解析）
     let comboText = ''
     // 用 miao-plugin Character.get 验证是否是合法角色名（跟 team() 里判断角色一致）
     try {
       for (const tok of allTokens) {
         if (roleTokens.length >= 4) break
-        // role name 可能带括号 (元素)，比如 那维莱特(水)
-        const nameOnly = tok.split('(')[0].trim()
+        // role name 可能带括号 (元素)，比如 那维莱特(水)；带换XX后缀的取换前面的部分
+        const nameOnly = tok.split('换')[0].split('(')[0].trim()
         const hitChar = Character.get(nameOnly)
         if (hitChar) {
-          roleTokens.push(tok)
+          roleTokens.push(tok.split('换')[0])
+          roleEntryTokens.push(tok)
         } else {
           break
         }
@@ -748,14 +727,28 @@ export class TeamDamage extends plugin {
       // Character.get 异常就按原 split 处理
     }
     if (roleTokens.length > 0) {
-      const usedLen = roleTokens.join(' ').length
-      // 剩的原文从 aliasExpandedText 截掉角色段就行；如果取不到就用 allTokens 里剩余部分拼成
-      const leftoverTokens = allTokens.slice(roleTokens.length)
-      comboText = leftoverTokens.join(',')
+      comboText = allTokens.slice(roleTokens.length).join(',')
     } else {
       // 一个角色都没命中（可能都是简称又没扩开的极端情况）→ 原来的 split 逻辑兜底
       roleTokens.push(...allTokens)
       comboText = ''
+    }
+
+    // 🔥【换XX角色变更解析】：只对已切出的角色条目解析（火神换狼末 → {weapon_change:狼的末路}）
+    const roleChangesArr = []
+    for (const entry of roleEntryTokens) {
+      if (entry.includes('换')) {
+        const parts = entry.split('换')
+        const roleName = parts[0].trim()
+        const changeTokens = parts.slice(1).map(s => s.trim()).filter(Boolean)
+        const changes = parseRoleChanges(changeTokens, roleName)
+        roleChangesArr.push(changes)
+        if (changes) {
+          logger.info(`[TD-plugin]角色变更[${roleName}]：${JSON.stringify(changes)}`)
+        }
+      } else {
+        roleChangesArr.push(null)
+      }
     }
 
     // 🔥【自定义手法最终字符串】优先级：inline 用户写的 > 简称绑定的
