@@ -63,17 +63,28 @@ function readPoolCache() {
   return {}
 }
 
-function savePoolCache(uid, type, cards) {
+function savePoolCache(uid, type, cards, pity) {
   const all = readPoolCache()
   const key = String(uid)
   all[key] = all[key] || {}
-  all[key][String(type)] = { at: Date.now(), cards: cards || [] }
+  const prev = all[key][String(type)] || {}
+  all[key][String(type)] = {
+    at: Date.now(),
+    cards: cards || prev.cards || [],
+    // 接口给的当前垫抽。本地记录里的四星三星是缺的，出图时靠它兜底
+    pity: pity === undefined ? prev.pity || 0 : Number(pity) || 0,
+  }
   try {
     fs.mkdirSync(path.dirname(POOL_CACHE), { recursive: true })
     fs.writeFileSync(POOL_CACHE, JSON.stringify(all, null, 1))
   } catch (err) {
     logger?.debug?.(`[xhh-TL][抽卡记录] 卡池缓存写入失败：${err.message}`)
   }
+}
+
+/** 取某池缓存下来的接口垫抽数 */
+function cachedPity(uid, type) {
+  return Number(readPoolCache()[String(uid)]?.[String(type)]?.pity) || 0
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -210,6 +221,8 @@ function toRecord(uid, type, node, gachaId) {
     rank_type: String(item.rarity || 5),
     id: String(node.id),
     xhh_src: 'mini',
+    // 接口直接给的「这一发花了多少抽」，出图时优先用它，不靠数占位
+    xhh_pity: String(node.gacha_count || ''),
   }
 }
 
@@ -268,11 +281,6 @@ function mergePool(userId, uid, type, remote, poolStat) {
   const local = readLocal(userId, uid, type)
   const real = local.filter(r => !r.xhh_ph)
   const usedIds = new Set(real.map(r => String(r.id)))
-  // 「已导入区间」只由完整逐抽来源（抽卡链接导入、导入 json）界定。
-  // 我们自己写进去的 mini 五星不算，否则第二次更新会把区间误判成完整、不再重建占位
-  const maxFullId = real
-    .filter(r => r.xhh_src !== 'mini')
-    .reduce((m, r) => (big(r.id) > m ? big(r.id) : m), 0n)
 
   // 本地五星按判重键分桶，接口里的同键记录逐个抵扣
   const buckets = new Map()
@@ -289,19 +297,27 @@ function mergePool(userId, uid, type, remote, poolStat) {
   let added5 = 0
   let addedPh = 0
   let skipped = 0
+  let patched = 0
+
+  // 完整逐抽来源（抽卡链接 / 导入）的 id，用来判断某段区间是不是已经有真实记录了。
+  // 不能只比「最大 id」——真实记录只覆盖最近几个月时，更早的五星区间其实是空的，
+  // 拿最大 id 一比会全判成「已有记录」，那些五星的抽数就会缩成 1
+  const fullIds = real
+    .filter(r => r.xhh_src !== 'mini' && !r.xhh_fid)
+    .map(r => big(r.id))
+    .sort((a, b) => (a > b ? 1 : a < b ? -1 : 0))
+  const hasFullIn = (lo, hi) => fullIds.some(id => id > lo && id < hi)
 
   /** 给某个五星补它之前的垫抽占位。anchorId 是这条五星在本地的 id */
   const fillGap = (s, i, anchorId, gachaId) => {
     const gap = Number(s.gacha_count) - 1
     if (gap <= 0) return
     const prevId = stars[i + 1] ? big(stars[i + 1].id) : 0n
-    // 垫抽区间是 (prevId, anchorId)。完整记录若落在区间内，这段本来就有真实数据，
-    // 再补占位等于把抽数算两遍
-    if (maxFullId > prevId && maxFullId < anchorId) {
-      notes.push(`${s.item.name}(${s.gacha_count}抽) 的垫抽跨入已导入区间，未补占位以避免重复计数`)
+    // 这段区间里已经有真实逐抽记录，再补占位就把抽数算两遍了
+    if (hasFullIn(prevId, anchorId)) {
+      notes.push(`${s.item.name}(${s.gacha_count}抽) 的区间已有完整记录，未补占位`)
       return
     }
-    if (maxFullId >= anchorId) return
     const phs = buildPlaceholders(uid, type, anchorId, prevId, gap, usedIds, idToTime(s.id), gachaId)
     added.push(...phs)
     addedPh += phs.length
@@ -315,8 +331,15 @@ function mergePool(userId, uid, type, remote, poolStat) {
     const hit = buckets.get(k)?.shift()
     if (hit) {
       skipped++
-      // 上一轮就是我们写进去的，它的占位刚被清掉，要按同样规则重建
-      if (hit.xhh_src === 'mini') fillGap(s, i, big(hit.id), gachaId)
+      if (hit.xhh_src === 'mini') {
+        // 老版本写进去的 mini 记录没有 xhh_pity，顺手补上（出图的抽数以它为准）
+        if (String(hit.xhh_pity || '') !== String(s.gacha_count)) {
+          hit.xhh_pity = String(s.gacha_count)
+          patched++
+        }
+        // 上一轮就是我们写进去的，它的占位刚被清掉，要按同样规则重建
+        fillGap(s, i, big(hit.id), gachaId)
+      }
       continue
     }
     added.push(toRecord(uid, type, s, gachaId))
@@ -328,10 +351,10 @@ function mergePool(userId, uid, type, remote, poolStat) {
   // 当前垫抽：最新五星之后又抽了 pity 抽还没出货
   if (remote.pity > 0) {
     const lastStarId = stars[0] ? big(stars[0].id) : 0n
-    if (maxFullId > lastStarId) {
-      notes.push(`当前垫抽 ${remote.pity} 抽跨入已导入区间，未补占位`)
+    const nowId = BigInt(Math.floor(Date.now() / 1000)) * 1000000000n
+    if (hasFullIn(lastStarId, nowId)) {
+      notes.push(`当前垫抽 ${remote.pity} 抽的区间已有完整记录，未补占位`)
     } else {
-      const nowId = BigInt(Math.floor(Date.now() / 1000)) * 1000000000n
       const phs = buildPlaceholders(
         uid,
         type,
@@ -347,7 +370,7 @@ function mergePool(userId, uid, type, remote, poolStat) {
     }
   }
 
-  const changed = added.length > 0 || local.length !== real.length
+  const changed = added.length > 0 || patched > 0 || local.length !== real.length
   if (changed) {
     const merged = [...added, ...real].sort((a, b) => {
       const x = big(a.id)
@@ -355,9 +378,9 @@ function mergePool(userId, uid, type, remote, poolStat) {
       return y > x ? 1 : y < x ? -1 : 0
     })
     writeLocal(userId, uid, type, merged)
-    return { added5, addedPh, skipped, notes, changed, total: merged.length }
+    return { added5, addedPh, skipped, patched, notes, changed, total: merged.length }
   }
-  return { added5, addedPh, skipped, notes, changed, total: local.length }
+  return { added5, addedPh, skipped, patched, notes, changed, total: local.length }
 }
 
 /** 星铁 UID：绑定库 → redis → 已有记录目录 */
@@ -469,16 +492,53 @@ async function prepareCookie(e, uid, user) {
 const POOL_LABEL = Object.fromEntries(POOLS.map(p => [p.type, p.name]))
 POOL_LABEL['1'] = '常驻跃迁'
 
+/**
+ * 从消息里的文件段拿下载直链。
+ * 各适配器字段不一样：icqq 是 `fid` + `getFileUrl`，OneBot v11 的群文件上传事件
+ * 只给 `{id, name, size, busid}`，得走 get_group_file_url 才有 url
+ */
+async function fileUrlFromSeg(e, seg) {
+  if (/^https?:\/\//.test(seg.url || '')) return seg.url
+  const fid = seg.fid || seg.id || seg.file_id
+  if (!fid) return ''
+  const tries = [
+    () => e.group?.getFileUrl?.(fid),
+    () => e.friend?.getFileUrl?.(fid),
+    () => e.group?.fs?.download?.(fid, seg.busid),
+    () => e.friend?.fs?.download?.(fid, seg.busid),
+    () =>
+      e.group_id &&
+      e.bot?.sendApi?.('get_group_file_url', {
+        group_id: e.group_id,
+        file_id: fid,
+        busid: seg.busid,
+      }),
+    () => e.bot?.sendApi?.('get_private_file_url', { user_id: e.user_id, file_id: fid }),
+  ]
+  for (const fn of tries) {
+    try {
+      const r = await fn()
+      const url = typeof r === 'string' ? r : r?.url || r?.data?.url || ''
+      if (/^https?:\/\//.test(url)) return url
+    } catch (err) {
+      logger?.debug?.(`[xhh-TL][抽卡记录] 取文件直链失败：${err.message}`)
+    }
+  }
+  return ''
+}
+
 /** 从消息里的文件段或链接取出导入文件 */
 async function fetchImportFile(e) {
   let url = ''
   let name = ''
-  if (e.file) {
-    name = e.file.name || ''
-    url = e.file.url || ''
-    if (!/^https?:\/\//.test(url) && e.file.fid) {
-      url = (await e.group?.getFileUrl?.(e.file.fid)) || (await e.friend?.getFileUrl?.(e.file.fid)) || ''
-    }
+  const seg =
+    e.file ||
+    (Array.isArray(e.message) ? e.message.find(m => m?.type === 'file') : null) ||
+    null
+  if (seg) {
+    name = seg.name || seg.file_name || seg.file || ''
+    url = await fileUrlFromSeg(e, seg)
+    if (!url) throw new Error('拿不到这个文件的下载地址，可以改成私聊发，或者把文件直链贴在指令后面')
   }
   if (!/^https?:\/\//.test(url)) {
     url = String(e.msg || '').match(/https?:\/\/[^\s]+/i)?.[0]?.replace(/[)>】」』"'，。！？；;]+$/g, '') || ''
@@ -660,6 +720,27 @@ function parsePoolType(msg = '') {
   }
 }
 
+/** 出图前顺手把当前池的垫抽刷新一下（缓存超过 10 分钟才动，失败就沿用旧值） */
+async function refreshPity(e, uid, type) {
+  const pool = POOLS.find(p => p.type === String(type))
+  if (!pool) return // 常驻池接口不给，本地算得出来
+  const entry = readPoolCache()[String(uid)]?.[String(type)]
+  if (entry?.at && Date.now() - entry.at < 10 * 60 * 1000) return
+  try {
+    const { cookie, region } = await prepareCookie(e, uid, null)
+    const gachaCookie = await badgeLogin(cookie, uid, region)
+    const q = new URLSearchParams({ gacha_type: pool.key, version_id: '0', max_id: '0' })
+    const { json } = await api(`${GACHA_BASE}/five_star_list?${q}`, { cookie: gachaCookie })
+    if (json?.retcode !== 0) return
+    const first = (json.data?.list || [])[0]
+    // 首条 item=null 的就是当前垫抽
+    const pity = first && !first.item ? Number(first.gacha_count) || 0 : 0
+    savePoolCache(uid, type, undefined, pity)
+  } catch (err) {
+    logger?.debug?.(`[xhh-TL][抽卡记录] 刷新垫抽失败，用缓存值：${err.message}`)
+  }
+}
+
 /** 组装小程序风格出图所需数据。只读本地记录自己算，不依赖 genshin 插件 */
 async function buildViewData(e, uid) {
   if (!uid) return null
@@ -667,7 +748,9 @@ async function buildViewData(e, uid) {
   const list = readLocal(e.user_id, uid, type)
   if (!list.length) return null
 
-  const stat = analyse(list, type)
+  await refreshPity(e, uid, type)
+  const entry = readPoolCache()[String(uid)]?.[String(type)]
+  const stat = analyse(list, type, Number(entry?.pity) || 0)
   const max = poolMax(type)
   const pct = n => Math.max(6, Math.min(100, (Number(n) / max) * 100))
 
@@ -718,7 +801,10 @@ async function buildViewData(e, uid) {
     fiveNum: fiveLog.length,
     firstTime: stat.firstTime,
     lastTime: stat.lastTime,
-    updatedAt: moment().format('MM-DD HH:mm'),
+    // 显示的是数据抓取时刻，不是出图时刻，免得让人以为垫抽是刚拉的
+    updatedAt: entry?.at
+      ? moment(entry.at).format('MM-DD HH:mm')
+      : (stat.lastTime || '').slice(5, 16) || moment().format('MM-DD HH:mm'),
   }
 }
 
@@ -726,10 +812,14 @@ async function buildViewData(e, uid) {
 async function buildAllViewData(e, uid) {
   if (!uid) return null
   const pools = []
+  let newestAt = 0
   for (const type of ['11', '12', '21', '22', '1', '2']) {
     const list = readLocal(e.user_id, uid, type)
     if (!list.length) continue
-    const stat = analyse(list, type)
+    await refreshPity(e, uid, type)
+    const entry = readPoolCache()[String(uid)]?.[String(type)]
+    if (entry?.at > newestAt) newestAt = entry.at
+    const stat = analyse(list, type, Number(entry?.pity) || 0)
     const five = []
     for (const it of stat.fiveLog) {
       five.push({
@@ -763,7 +853,7 @@ async function buildAllViewData(e, uid) {
     totalFive,
     totalYs: ys >= 10000 ? `${(ys / 10000).toFixed(2)}w` : String(ys),
     avg: totalFive ? Math.round(total / totalFive) : 0,
-    updatedAt: moment().format('MM-DD HH:mm'),
+    updatedAt: moment(newestAt || Date.now()).format('MM-DD HH:mm'),
   }
 }
 
@@ -1160,17 +1250,19 @@ export class srGachaLog extends plugin {
     let added5 = 0
     let addedPh = 0
     let skipped = 0
+    let patchedTotal = 0
     let remoteTotal = 0
 
     for (const pool of POOLS) {
       const remote = await fetchFiveStars(gachaCookie, pool.key)
       const poolStat = await fetchPoolStat(gachaCookie, pool.key)
-      savePoolCache(uid, pool.type, poolStat.cards)
+      savePoolCache(uid, pool.type, poolStat.cards, remote.pity)
       const res = mergePool(userId, uid, pool.type, remote, poolStat)
 
       added5 += res.added5
       addedPh += res.addedPh
       skipped += res.skipped
+      patchedTotal += res.patched || 0
       remoteTotal += remote.list.length
       notes.push(...res.notes)
       if (remote.pity > 0) pityParts.push(`${pool.name}${remote.pity}抽`)
@@ -1182,6 +1274,7 @@ export class srGachaLog extends plugin {
     return [
       `新增五星 ${added5} 条（接口给出 ${remoteTotal} 条，${skipped} 条本地已有）`,
       `占位 ${addedPh} 条`,
+      patchedTotal ? `补齐 ${patchedTotal} 条记录的接口抽数` : '',
       pityParts.length ? `垫抽 ${pityParts.join('/')}` : '',
       lines.join(' '),
       ...notes,

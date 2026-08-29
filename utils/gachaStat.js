@@ -84,9 +84,10 @@ export const poolMax = type => (['12', '22', 12, 22].includes(type) ? 80 : 90)
 
 /**
  * 统计一个池。list 是 srJson 里的原始数组（新→旧）
+ * apiPity 是小程序接口给的当前垫抽——本地缺四星三星记录时靠它兜底
  * 返回值字段名与 genshin analyse() 保持一致，方便对照
  */
-export function analyse(list, type) {
+export function analyse(list, type, apiPity = 0) {
   const all = Array.isArray(list) ? list : []
   const fiveLog = []
   const fourLog = {}
@@ -132,6 +133,8 @@ export function analyse(list, type) {
         item_id: row.item_id,
         num: 0,
         isUp,
+        // 小程序接口直接给的抽数，比数占位可靠（占位受 id 空间限制可能补不满）
+        pity: Number(row.xhh_pity) || 0,
       })
     }
     fiveLogNum++
@@ -139,6 +142,10 @@ export function analyse(list, type) {
 
   if (fiveLog.length > 0) {
     fiveLog[fiveLog.length - 1].num = fiveLogNum
+    // 有接口原值的一律以它为准
+    for (const it of fiveLog) if (it.pity > 0) it.num = it.pity
+    // 最新五星之后的抽数：接口知道、但那些四星三星记录本地没有，取大的那个
+    noFiveNum = Math.max(noFiveNum, Number(apiPity) || 0)
     // 上一个五星是不是常驻（小保底标记）
     fiveLog.forEach((it, i) => {
       const prev = fiveLog[i + 1]
@@ -149,6 +156,8 @@ export function analyse(list, type) {
         it.minimum = false
       }
     })
+    // 占位没补满时记录数会偏少，用五星抽数之和把总抽数校正回来
+    allNum = Math.max(allNum, fiveLog.reduce((n, x) => n + x.num, 0) + noFiveNum)
   } else {
     noFiveNum = allNum
   }
