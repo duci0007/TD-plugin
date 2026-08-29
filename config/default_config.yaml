@@ -1,0 +1,32 @@
+# TD-plugin 默认配置（随仓库更新）
+# 用户请改 config/config.yaml（不会被 git 覆盖）
+# 首次启动会自动从本文件复制生成 config.yaml
+
+# 全局倍率微调：1.0=模板推荐倍率；可调 0.8~1.5，最终 scale 上限 2.5
+render_scale: 1.0
+
+# 深渊配队 / 危战配队 / 持有率 共用背景（目录或单张图）
+# 默认用插件自带图，Linux/Win 通用相对路径：
+#   plugins/TD-plugin/resources/stat/imgs/bg1.png
+# 也可改成角色面板目录（子文件夹=角色名，随机抽图），例如：
+#   plugins/miao-plugin/resources/profile/normal-character
+# Windows 也可用绝对路径：D:/Yunzai/plugins/...
+role_combat_bg_folder: plugins/TD-plugin/resources/stat/imgs/bg1.png
+
+# 原神深渊配队（#深渊配队）：提瓦特小助手数据 + 本人练度排序
+abyss_team: true
+# 深渊配队毛玻璃主题：留空浅色 / light 浅色 / dark 深色
+abyss_team_theme: ""
+abyss_team_priority: -98
+
+# 幽境危战配队（#危战配队）：提瓦特小助手幽境危战统计 + 本人练度排序
+hard_team: true
+# 危战配队毛玻璃主题：留空浅色 / light 浅色 / dark 深色
+hard_team_theme: ""
+hard_team_priority: -98
+
+# 角色持有率（#角色持有率）：提瓦特小助手深渊统计的角色持有比例
+hold_rate: true
+# 角色持有率毛玻璃主题：留空浅色 / light 浅色 / dark 深色
+hold_rate_theme: ""
+hold_rate_priority: -98

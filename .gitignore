@@ -1,7 +1,11 @@
 node_modules/
 # 调试/探测脚本
 _*.mjs
+_*.js
 # 用户数据（含个人配队简称）
 config/teamAlias.json
+# 用户配置（更新不覆盖）
+config/config.yaml
 # 缓存数据
 config/TeyvatConfig/TeyvatUrlJson.json
+data/
