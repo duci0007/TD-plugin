@@ -26,12 +26,13 @@ import plugin from '../../../lib/plugins/plugin.js'
 import { getstoken, stokenToCookie, findStokenEntry, cookiePart } from '../utils/auth.js'
 import { createUser } from '../utils/userBind.js'
 import { ensureRuntime } from '../utils/runtimePatch.js'
-import { config, pluginDir, getRenderScaleStyle } from '../utils/pluginConfig.js'
+import { config, pluginDir, getRenderScaleStyle, loadStokenYaml } from '../utils/pluginConfig.js'
 import { extractRenderBuffer, toWebp } from '../utils/renderImage.js'
 import { parseImportFile } from '../utils/gachaImport.js'
 import { analyse, buildLine, getIcon, poolMax } from '../utils/gachaStat.js'
 
 const BADGE_LOGIN = 'https://api-takumi.mihoyo.com/common/badge/v1/login/account'
+const SR_ROLES = 'https://api-takumi.mihoyo.com/binding/api/getUserGameRolesByCookie?game_biz=hkrpg_cn'
 const GACHA_BASE = 'https://act-api-takumi.mihoyo.com/event/rpg_gacha_record'
 const REFERER = 'https://act.mihoyo.com/sr/event/gt-aio/gacha-records/index.html'
 const UA =
@@ -52,6 +53,41 @@ const ITEM_TYPE = { ItemType_Avatar: '角色', ItemType_Equipment: '光锥' }
 const PLACEHOLDER = { item_id: '20006', name: '智库', item_type: '光锥' }
 
 const SR_JSON_DIR = path.join(process.cwd(), 'data', 'srJson')
+
+/**
+ * 「绑定的 UID → 米游社实际的星铁 UID」纠正表，key 是 `QQ:绑定的UID`。
+ * 没装 genshin / xiaoyao 的实例上，绑定库里的星铁 UID 常常是原神 UID，
+ * 更新时能靠米游社角色列表纠正过来，但出图那条路只认绑定库，会读错目录、
+ * 报「还没有抽卡记录」。所以纠正一次就记下来，之后各条路都用同一个号。
+ * 用户后来改绑成别的号时 key 对不上，自然失效；要整体复位删掉这个文件即可。
+ */
+const UID_FIX = path.join(pluginDir, 'data', 'sr_uid_fix.json')
+
+function readUidFix() {
+  try {
+    if (fs.existsSync(UID_FIX)) return JSON.parse(fs.readFileSync(UID_FIX, 'utf8')) || {}
+  } catch (_) {}
+  return {}
+}
+
+/** 查纠正表；没记过就原样返回 */
+function fixedUid(qq, uid) {
+  if (!uid) return String(uid || '')
+  const real = readUidFix()[`${qq}:${uid}`]
+  return real ? String(real) : String(uid)
+}
+
+function saveUidFix(qq, uid, real) {
+  if (!uid || !real || String(uid) === String(real)) return
+  const all = readUidFix()
+  all[`${qq}:${uid}`] = String(real)
+  try {
+    fs.mkdirSync(path.dirname(UID_FIX), { recursive: true })
+    fs.writeFileSync(UID_FIX, JSON.stringify(all, null, 1))
+  } catch (err) {
+    logger?.debug?.(`[xhh-TL][抽卡记录] UID 纠正表写入失败：${err.message}`)
+  }
+}
 
 /** 卡池期次统计的落盘缓存：更新时顺手存下来，出图时不必再请求接口 */
 const POOL_CACHE = path.join(pluginDir, 'data', 'sr_gacha_pools.json')
@@ -137,9 +173,18 @@ async function api(url, { cookie, body, timeout = 20000 } = {}) {
     })
     let setCookie = []
     try {
-      // Yunzai 根目录的 node-fetch 是原生 fetch 的 shim，没有 headers.raw()；
-      // 原生 fetch 用 getSetCookie()，真 node-fetch 用 raw()['set-cookie']
-      setCookie = res.headers.getSetCookie?.() || res.headers.raw?.()['set-cookie'] || []
+      // 取 set-cookie 三条路都要留：node-fetch v2/v3 走 headers.raw()（插件自带 v3，有 raw）；
+      // 解析到 undici / 原生 fetch 时只有 getSetCookie()；两个都没有就退回 headers.get()，
+      // 那会把多条挤成一条，下面按 key= 边界再切开。
+      // 注意别拿「在插件目录外复制源码跑」的结果推断这里：那样解析到的是宿主的 undici 垫片
+      if (typeof res.headers.raw === 'function') {
+        setCookie = res.headers.raw()['set-cookie'] || []
+      } else if (typeof res.headers.getSetCookie === 'function') {
+        setCookie = res.headers.getSetCookie() || []
+      } else {
+        const merged = res.headers.get('set-cookie')
+        if (merged) setCookie = [merged]
+      }
     } catch (_) {}
     return { json: await res.json().catch(() => null), setCookie }
   } finally {
@@ -154,11 +199,19 @@ async function badgeLogin(mysCookie, uid, region) {
     body: { game_biz: 'hkrpg_cn', lang: 'zh-cn', region: region || 'prod_gf_cn', uid: String(uid) },
   })
   if (json?.retcode !== 0) {
+    // -1002 米游社原话是「角色不存在或等级不符」，实测它同时对应「UID 不在本账号下」
+    // 和「region 传错」两种，跟等级无关；抛原文会让人以为是等级不够
+    if (json?.retcode === -1002) {
+      throw new Error(`米游社查不到 UID ${uid} 这个角色，确认下扫码登录的是这个号，或者 #刷新ck 后再试`)
+    }
     throw new Error(`换取抽卡记录凭证失败：${json?.message || '接口无响应'}（${json?.retcode}）`)
   }
   const act = setCookie
-    .filter(c => !/^aliyungf_tc=/.test(c))
-    .map(c => c.split(';')[0])
+    // 走 headers.get() 兜底时多条 cookie 挤在一条里，按「逗号后紧跟 key=」切回来
+    // （Expires 里的逗号后面到分号前没有 =，不会被误切）
+    .flatMap(c => String(c).split(/,(?=[^;,]+=)/))
+    .map(c => c.split(';')[0].trim())
+    .filter(c => /^[\w-]+=/.test(c) && !/^aliyungf_tc=/.test(c))
     .join(';')
   if (!/e_hkrpg_token=/.test(act)) throw new Error('接口没有下发 e_hkrpg_token，凭证可能已失效')
   return `${mysCookie};${act}`
@@ -471,18 +524,18 @@ function mergePool(userId, uid, type, remote, poolStat) {
   return { added5, addedPh, skipped, patched, notes, changed, total: local.length }
 }
 
-/** 星铁 UID：绑定库 → redis → 已有记录目录 */
+/** 星铁 UID：绑定库 → redis → 已有记录目录。前两条要过一遍纠正表，绑的号可能压根不是星铁号 */
 async function resolveSrUid(e) {
   try {
     const user = await createUser(e.user_id, e)
     const uid = user?.getUid?.('sr')
-    if (uid) return { uid: String(uid), user }
+    if (uid) return { uid: fixedUid(e.user_id, uid), user }
   } catch (err) {
     logger?.debug?.(`[xhh-TL][抽卡记录] createUser 失败：${err.message}`)
   }
   try {
     const v = await redis?.get?.(`Yz:srJson:mys:qq-uid:${e.user_id}`)
-    if (v) return { uid: String(v), user: null }
+    if (v) return { uid: fixedUid(e.user_id, v), user: null }
   } catch (_) {}
   try {
     const dir = path.join(SR_JSON_DIR, String(e.user_id))
@@ -535,7 +588,11 @@ async function boundSrUids(e) {
   try {
     const user = await createUser(e.user_id, e)
     const list = user?.getUidList?.('sr') || []
-    return list.map(x => String(x?.uid ?? x)).filter(u => /^\d+$/.test(u))
+    const uids = list.map(x => String(x?.uid ?? x)).filter(u => /^\d+$/.test(u))
+    // 绑的号可能被纠正过（没装 genshin 的实例上常把原神 UID 当成星铁 UID 绑），
+    // 一律换成纠正后的真号：错号在米游社那边本来就查不通，导出文件里也不会写它。
+    // 这里换掉而不是并存，Excel 那种不带 UID 的文件才不会落到错号的目录下
+    return [...new Set(uids.map(u => fixedUid(e.user_id, u)))]
   } catch (err) {
     logger?.debug?.(`[xhh-TL][抽卡记录] 读绑定列表失败：${err.message}`)
     return []
@@ -558,16 +615,23 @@ async function probeLinkUid(params) {
   return ''
 }
 
-/** 星铁 region 按 UID 首位推断。yaml 里的 region 常常是原神的（cn_gf01），直接拿来用会被判 -1002 */
+/**
+ * 星铁 region 按 UID 号段推断 —— 只在拿不到米游社角色列表时兜底。
+ * 取「除末 8 位以外的前缀」而不是首位：亚服有 18 开头的 10 位 UID，
+ * 只看首位会把它判成国服。号段映射跟 genshin 插件 model/gachaLog.js 的 getServer 对齐
+ * （欧服是 prod_official_euro，写成 eur 会被米游社判角色不存在）。
+ * yaml 里的 region 常常是原神的（cn_gf01），直接拿来用同样会被判 -1002。
+ */
 function guessSrRegion(uid) {
-  switch (String(uid)[0]) {
+  switch (String(uid).slice(0, -8)) {
     case '5':
       return 'prod_qd_cn'
     case '6':
       return 'prod_official_usa'
     case '7':
-      return 'prod_official_eur'
+      return 'prod_official_euro'
     case '8':
+    case '18':
       return 'prod_official_asia'
     case '9':
       return 'prod_official_cht'
@@ -595,8 +659,63 @@ async function fetchCookieToken(stuid, stoken, mid) {
   return ct
 }
 
-/** 取该 UID 可用的米游社 cookie（必须含 cookie_token）与所在区服 */
-async function prepareCookie(e, uid, user) {
+/**
+ * 该米游社账号名下的星铁角色，返回 [{uid, region, nickname, level}]；接口没给就返回 null。
+ * 有了它 region 就不用按号段猜（B 服 / 亚服 / 欧服全靠猜很容易错），
+ * 也能在换凭证之前判出「这个 UID 不属于这个账号」——
+ * 否则只能等米游社回 -1002，而那个码同时对应「区服错」和「角色不属于本账号」，分不清。
+ */
+async function fetchSrRoles(cookie) {
+  try {
+    const res = await fetch(SR_ROLES, {
+      headers: { 'User-Agent': UA, Cookie: cookie, Referer: 'https://app.mihoyo.com' },
+      signal: AbortSignal.timeout(15000),
+    })
+    const json = await res.json().catch(() => null)
+    if (json?.retcode !== 0) {
+      logger?.debug?.(`[xhh-TL][抽卡记录] 取角色列表失败：${json?.message}（${json?.retcode}）`)
+      return null
+    }
+    return (json?.data?.list || [])
+      .map(r => ({
+        uid: String(r.game_uid || ''),
+        region: String(r.region || ''),
+        nickname: r.nickname || '',
+        level: r.level,
+        chosen: !!r.is_chosen,
+      }))
+      .filter(r => r.uid)
+  } catch (err) {
+    logger?.debug?.(`[xhh-TL][抽卡记录] 取角色列表异常：${err.message}`)
+    return null
+  }
+}
+
+/** 一条 stoken 素材 → 含 cookie_token 的米游社 cookie；换不出来返回空串 */
+async function cookieFromEntry({ stuid, stoken, mid, raw }) {
+  if (stuid && stoken) {
+    try {
+      return `account_id=${stuid};cookie_token=${await fetchCookieToken(stuid, stoken, mid)}`
+    } catch (err) {
+      logger?.debug?.(`[xhh-TL][抽卡记录] passport 换 cookie_token 失败：${err.message}`)
+    }
+  }
+  if (raw) {
+    // 兜底：插件既有的换取逻辑，或本身就是含 cookie_token 的完整 ck
+    const fallback = await stokenToCookie(typeof raw === 'string' ? { ck_stoken: raw } : raw)
+    if (/cookie_token=/.test(fallback || '')) return fallback
+  }
+  return ''
+}
+
+/**
+ * 取该 UID 可用的米游社 cookie（必须含 cookie_token）、所在区服，以及真正要用的 UID。
+ * `allowFix` 只给 `*更新抽卡记录` 开：本地绑的 UID 跟米游社对不上时（多见于没装
+ * genshin/xiaoyao 的实例上把原神 UID 当成星铁 UID 绑了），直接改用这个账号名下真实的
+ * 星铁角色，不然用户既没法改绑也查不了。出图路径不能开——那边的 UID 决定读哪个目录，
+ * 换了就会把两个号的记录混在一起。
+ */
+async function prepareCookie(e, uid, user, { allowFix = false } = {}) {
   // getstoken 返回的是 cookie 串（不是对象）
   const raw = await getstoken(e.user_id, uid, e)
   if (!raw) {
@@ -604,40 +723,83 @@ async function prepareCookie(e, uid, user) {
   }
   const src = typeof raw === 'string' ? raw : raw.ck_stoken || raw.ck || ''
   const yamlEntry = findStokenEntry(e.user_id, String(uid)) || {}
-  const stuid =
-    cookiePart(src, 'stuid') ||
-    cookiePart(src, 'ltuid') ||
-    cookiePart(src, 'account_id') ||
-    yamlEntry.stuid ||
-    ''
-  const stoken = cookiePart(src, 'stoken') || yamlEntry.stoken || ''
-  const mid = cookiePart(src, 'mid') || yamlEntry.mid || ''
 
-  let cookie = ''
-  if (stuid && stoken) {
-    try {
-      cookie = `account_id=${stuid};cookie_token=${await fetchCookieToken(stuid, stoken, mid)}`
-    } catch (err) {
-      logger?.debug?.(`[xhh-TL][抽卡记录] passport 换 cookie_token 失败：${err.message}`)
+  // 候选凭证：getstoken 挑的那份排头，后面补上同 QQ 名下别的米游社账号。
+  // 多号用户身上 getstoken 可能挑到不是这个 UID 属主的那份（体力查询无所谓，
+  // 抽卡记录这一步会被米游社判成角色不存在），所以按「名下有没有这个 UID」逐个试。
+  const cands = [
+    {
+      stuid:
+        cookiePart(src, 'stuid') ||
+        cookiePart(src, 'ltuid') ||
+        cookiePart(src, 'account_id') ||
+        yamlEntry.stuid ||
+        '',
+      stoken: cookiePart(src, 'stoken') || yamlEntry.stoken || '',
+      mid: cookiePart(src, 'mid') || yamlEntry.mid || '',
+      raw,
+    },
+  ]
+  for (const entry of Object.values(loadStokenYaml(e.user_id) || {})) {
+    if (!entry?.stuid || !entry?.stoken) continue
+    if (cands.some(c => String(c.stuid) === String(entry.stuid))) continue
+    cands.push({ stuid: String(entry.stuid), stoken: entry.stoken, mid: entry.mid || '', raw: null })
+  }
+
+  let firstCookie = ''
+  let rolesOk = false // 至少有一枚凭证成功问出过角色列表
+  const pool = [] // 这些凭证名下的星铁角色，用来纠正 UID 或在对不上时举例
+  for (const c of cands) {
+    const cookie = await cookieFromEntry(c)
+    if (!cookie) {
+      logger?.debug?.(`[xhh-TL][抽卡记录] 凭证 ${c.stuid} 换不出 cookie_token，跳过`)
+      continue
+    }
+    if (!firstCookie) firstCookie = cookie
+    const roles = await fetchSrRoles(cookie)
+    if (!roles) continue // 接口没响应，留给下面的号段兜底
+    rolesOk = true
+    const hit = roles.find(r => r.uid === String(uid))
+    logger?.debug?.(
+      `[xhh-TL][抽卡记录] 凭证 ${c.stuid} 名下星铁角色 ${roles.map(r => r.uid).join('/') || '无'}，找 ${uid} ${hit ? '命中' : '没命中'}`
+    )
+    if (hit) return { cookie, region: hit.region || guessSrRegion(uid), uid: String(uid) }
+    for (const r of roles) {
+      if (!pool.some(x => x.uid === r.uid)) pool.push({ ...r, cookie })
     }
   }
-  if (!cookie) {
-    // 兜底：插件既有的换取逻辑，或本身就是含 cookie_token 的完整 ck
-    const fallback = await stokenToCookie(typeof raw === 'string' ? { ck_stoken: raw } : raw)
-    if (/cookie_token=/.test(fallback || '')) cookie = fallback
+  if (!firstCookie) {
+    throw new Error('拿不到米游社凭证，stoken 可能已失效，重新扫码登录一次试试')
   }
-  if (!cookie) {
-    throw new Error('拿不到 cookie_token，stoken 可能已失效，重新扫码登录一次试试')
+  // 凭证是好的，但名下确实没有这个 UID —— 绑错号，或者把原神 UID 当成星铁 UID 绑了
+  if (pool.length) {
+    if (allowFix) {
+      // is_chosen 是米游社自己的默认角色，多号时按它挑最稳
+      const pick = pool.find(r => r.chosen) || pool[0]
+      logger?.warn?.(
+        `[xhh-TL][抽卡记录] 绑定的 ${uid} 不在米游社账号名下，改用名下的星铁角色 ${pick.uid}` +
+          `（名下共 ${[...new Set(pool.map(r => r.uid))].length} 个）`
+      )
+      // 记下来，出图那条路只认绑定库，不然更新写进新号、出图去读旧号会说「还没有记录」
+      saveUidFix(e.user_id, uid, pick.uid)
+      return { cookie: pick.cookie, region: pick.region || guessSrRegion(pick.uid), uid: pick.uid }
+    }
+    const list = [...new Set(pool.map(r => r.uid))].slice(0, 3).join('、')
+    throw new Error(`UID ${uid} 不在你登录的米游社账号下（这个号能查的是 ${list}），换成对应的号扫码登录再试`)
   }
-
-  // 只认星铁自己的 region 命名，其余（比如 yaml 里混进来的原神 cn_gf01）按 UID 推断
+  if (rolesOk) {
+    // 「角色列表通了但一个星铁角色都没有」这个形态没能在自己的号上实测过（名下都有角色），
+    // 万一米游社在这种情况下回的不是 retcode=0 + 空列表，这里不触发、照旧走下面的号段兜底
+    throw new Error('你的米游社账号下没有崩铁角色，先在米游社里进一次崩铁再来更新')
+  }
+  // 角色列表接口没给结果：退回老办法，region 按绑定信息 / 号段推断，成不成交给下一步
   const candidates = [
     (user?.getUidList?.('sr') || []).find(x => String(x.uid) === String(uid))?.region,
     yamlEntry.sr_region,
     String(uid) === String(yamlEntry.uid) ? yamlEntry.region : '',
   ]
   const region = candidates.find(r => /^prod_/.test(String(r || ''))) || guessSrRegion(uid)
-  return { cookie, region }
+  return { cookie: firstCookie, region, uid: String(uid) }
 }
 
 
@@ -1230,7 +1392,7 @@ export class srGachaLog extends plugin {
       rule: [
         // 抽卡链接：只吃星铁的（含 hkrpg），原神的交回 genshin
         { reg: 'authkey=', fnc: 'logUrl' },
-        { reg: '^\\s*#?星铁(?:强制)?(?:更新|获取)抽卡记录\\s*$', fnc: 'updateLog' },
+        { reg: '^\\s*#?星铁(?:[xX][hH][hH]|小火花)?(?:强制)?(?:更新|获取)抽卡记录\\s*$', fnc: 'updateLog' },
         {
           // 允许「*导入记录」后面直接跟文件直链，也支持只发指令+附件
           reg: '^\\s*#?星铁(?:强制)?导入(?:抽卡)?记录(?:json|excel|xlsx)?(?:\\s+\\S+)?\\s*$',
@@ -1445,14 +1607,15 @@ export class srGachaLog extends plugin {
       return true
     }
     await this.reply('崩铁抽卡记录更新中，请稍等...', false, { at: true })
-    // 第一次更新（本地一条记录都没有）出总览图，让人一眼看到所有池；之后照旧出单池图
-    const first = !hasLocalRecords(this.e.user_id, uid)
     try {
-      const { cookie, region } = await prepareCookie(this.e, uid, user)
-      const gachaCookie = await badgeLogin(cookie, uid, region)
+      // 绑的 UID 可能跟米游社对不上，这里拿到的才是真正要用的号
+      const { cookie, region, uid: realUid } = await prepareCookie(this.e, uid, user, { allowFix: true })
+      const gachaCookie = await badgeLogin(cookie, realUid, region)
+      // 第一次更新（本地一条记录都没有）出总览图，让人一眼看到所有池；之后照旧出单池图
+      const first = !hasLocalRecords(this.e.user_id, realUid)
       // 更新完不发文案，统计只落日志，直接出图
-      logger?.info?.(`[xhh-TL][抽卡记录] ${uid} ${await this.runUpdate(uid, gachaCookie)}`)
-      await (first ? this.renderAll(uid) : this.renderMini(uid))
+      logger?.info?.(`[xhh-TL][抽卡记录] ${realUid} ${await this.runUpdate(realUid, gachaCookie)}`)
+      await (first ? this.renderAll(realUid) : this.renderMini(realUid))
     } catch (err) {
       logger?.error?.(`[xhh-TL][抽卡记录] ${uid} 更新失败：${err.stack || err.message}`)
       await this.reply(`崩铁抽卡记录更新失败：${err.message}`, false, { at: true })
