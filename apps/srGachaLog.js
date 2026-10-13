@@ -38,13 +38,22 @@ const REFERER = 'https://act.mihoyo.com/sr/event/gt-aio/gacha-records/index.html
 const UA =
   'Mozilla/5.0 (Linux; Android 13; V2183A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 miHoYoBBS/2.71.1'
 
-/** 小程序的卡池枚举 → genshin srJson 的文件名（数字 gacha_type）。接口没有常驻池 */
+/**
+ * 小程序的卡池枚举 → genshin srJson 的文件名（数字 gacha_type）。
+ *
+ * ⚠️ 常驻池的枚举是 `GachaType_Standard`，**不能**照角色池的命名规律猜成
+ * `GachaType_Normal` / `GachaType_AvatarStandard` 之类 —— 猜错的名字接口回 -502
+ * （实测 8 个候选里只有 Standard 是通的）。之前这张表漏了它，表现是
+ * 「*更新抽卡记录 跑完角色池有更新、常驻池纹丝不动」，本地 1.json 只能靠
+ * 游戏内抽卡链接（authkey）补，链接不发就永远停在旧数据上。
+ */
 const POOLS = [
   { key: 'GachaType_AvatarUp', type: '11', name: '角色活动跃迁' },
   { key: 'GachaType_EquipmentUp', type: '12', name: '光锥活动跃迁' },
   { key: 'GachaType_CollabAvatarUp', type: '21', name: '联动角色跃迁' },
   { key: 'GachaType_CollabEquipmentUp', type: '22', name: '联动光锥跃迁' },
   { key: 'GachaType_Newbie', type: '2', name: '新手跃迁' },
+  { key: 'GachaType_Standard', type: '1', name: '常驻跃迁' },
 ]
 
 const ITEM_TYPE = { ItemType_Avatar: '角色', ItemType_Equipment: '光锥' }
@@ -249,10 +258,17 @@ async function fetchFiveStars(cookie, poolKey) {
   return { list, pity: pity || 0 }
 }
 
-/** 卡池期次统计，用来给记录补 gacha_id（按 up 五星的 item_id 对应） */
+/**
+ * 卡池期次统计，用来给记录补 gacha_id（按 up 五星的 item_id 对应）。
+ *
+ * 常驻池（群星跃迁）也走这个接口，但只回一张「整池」卡：up_item 是 null、
+ * gacha_id 固定 1001、total_count 是全池累计（实测 55 抽）。up_item 为 null
+ * 意味着 byUpItem 建不出条目，所以常驻池的 gacha_id 靠 gachaOf 兜底成 1001。
+ */
 async function fetchPoolStat(cookie, poolKey) {
   const q = new URLSearchParams({ gacha_type: poolKey })
   const { json } = await api(`${GACHA_BASE}/pool_stat?${q}`, { cookie })
+  // 失败一律当空（个别池 / 个别账号会回非 0），调用方对空 cards 有兜底
   const cards = json?.retcode === 0 ? json.data?.cards || [] : []
   const byUpItem = new Map()
   for (const c of cards) {
@@ -306,9 +322,98 @@ function readLocal(userId, uid, type) {
  * 出图是只读路径，不该因为某个池的文件坏了就整张图出不来；但也不能把损坏当「空库」
  * 交给写入路径（那会覆盖掉原文件）。所以这里单独包一层，只给 buildViewData / buildAllViewData 用。
  */
+/**
+ * 出图路径的防御性去重：同一发五星被记了两次时只留真实那条，
+ * 并把被顶替的 mini 名下的占位一并清掉。
+ *
+ * 判据与写入路径同一套：item_id + id 前 10 位（批次）精确，item_id + 日期兜底
+ * （Excel 导入的伪 id 与接口批次水位对不上，只能按日期对）。计数一对一消耗，
+ * 双黄（同批次两条同名五星）不会被误删成一条。
+ *
+ * ⚠️ 必须连占位一起清。analyse 里一条五星的抽数 = 它到**更旧那条五星**之间的记录数，
+ * 光删 mini 的话，它上方那批占位就整段落进上一条五星的间隔里，抽数直接翻倍
+ * （实测 68 抽变成 68+54=122）。
+ *
+ * 占位是给「上一条五星」撑抽数用的，所以它挂在**被删 mini 的上方**（id 更大侧），
+ * 且与锚点同批次。判据取「批次相同」而不是「位置相邻」：
+ *   - mini 与它的配对真实记录是同一发，批次（id 前 10 位）必然相同；
+ *   - 占位由 buildPlaceholders 从锚点 id 往下递减造出，前 10 位与锚点保持一致。
+ * 于是「批次 == 被删 mini 的批次」精确圈出这批占位，
+ * 不会误伤给别条五星（别的批次）造的那些。
+ */
+function dedupeMini(list) {
+  if (!Array.isArray(list) || list.length < 2) return list
+  const realKeys = new Map()
+  const bump = (k) => realKeys.set(k, (realKeys.get(k) || 0) + 1)
+  for (const r of list) {
+    if (r.xhh_ph || r.xhh_src === 'mini') continue
+    bump(`${r.item_id}@${String(r.id).slice(0, 10)}`)
+    if (r.time) bump(`${r.item_id}@${String(r.time).slice(0, 10)}`)
+  }
+  if (!realKeys.size) return list
+
+  // 同批次（id 前 10 位）的记录总数，不含 mini —— 就是这一发实际花掉的抽数。
+  // 占位本来就是「补齐到接口给的 gacha_count」造的，所以这个数就是接口那个值。
+  // 删掉占位后要靠它给接班的真实记录兜底，否则没存过 xhh_pity 的老记录会缩水成
+  // 「本地那几条真实逐抽数」。
+  const batchTotal = new Map()
+  for (const r of list) {
+    if (r.xhh_src === 'mini') continue
+    const b = String(r.id).slice(0, 10)
+    batchTotal.set(b, (batchTotal.get(b) || 0) + 1)
+  }
+
+  const drop = new Set()
+  // 自上一个五星以来攒下的占位。list 是 id 降序，所以它们是「更新」的一批，
+  // 正是给上一条五星撑抽数的那些
+  let pendingPh = []
+  const flush = (batch) => {
+    for (const p of pendingPh) {
+      if (String(p.id).slice(0, 10) === batch) drop.add(p)
+    }
+    pendingPh = []
+  }
+
+  for (const r of list) {
+    if (String(r.rank_type) === '5') {
+      if (r.xhh_src === 'mini') {
+        const keys = [`${r.item_id}@${String(r.id).slice(0, 10)}`]
+        if (r.time) keys.push(`${r.item_id}@${String(r.time).slice(0, 10)}`)
+        const hit = keys.find((k) => (realKeys.get(k) || 0) > 0)
+        if (hit) {
+          realKeys.set(hit, realKeys.get(hit) - 1)
+          drop.add(r)
+          const batch = String(r.id).slice(0, 10)
+          flush(batch)
+          // 接班的那条真实五星（同批次）。占位一删它的本地间隔就只剩真实逐抽了，
+          // 没存过抽数的话用批次总数补上。
+          // ⚠️ 只在「该批次恰好只有一个非 mini 五星」时才敢用 batchTotal 当抽数：
+          // 这时批次里的记录正好是「上一条五星之后到这一条」的全部，等于接口给的 gacha_count。
+          // 同批次有两个五星（十分钟内连出）时，批内会混进上一条五星之前的记录，
+          // 拿总数当抽数会多算 —— 这种情况宁可不动，交给 analyse 取 max 兜底
+          const fiveInBatch = list.filter(
+            (x) => String(x.rank_type) === '5' && x.xhh_src !== 'mini' &&
+              String(x.id).slice(0, 10) === batch,
+          )
+          const total = batchTotal.get(batch) || 0
+          if (fiveInBatch.length === 1 && total > 0 && Number(fiveInBatch[0].xhh_pity || 0) < total) {
+            fiveInBatch[0].xhh_pity = String(total)
+          }
+          continue
+        }
+      }
+      // 保留的五星：它上方那批占位是有用的，留着
+      pendingPh = []
+    } else if (r.xhh_ph) {
+      pendingPh.push(r)
+    }
+  }
+  return list.filter((r) => !drop.has(r))
+}
+
 function readLocalForView(userId, uid, type) {
   try {
-    return readLocal(userId, uid, type)
+    return dedupeMini(readLocal(userId, uid, type))
   } catch (err) {
     logger?.error?.(`[xhh-TL][抽卡记录] ${type} 池读取失败，本次出图跳过该池：${err?.message}`)
     return []
@@ -410,11 +515,34 @@ const dupKeyBucket = (itemId, id) => {
 }
 
 /**
+ * 常驻池的 gacha_id 恒为 1001（不是期次编号，是「群星跃迁」这个池本身的固定 id）。
+ * pool_stat 对常驻池只回一张整池卡、up_item 是 null，byUpItem 建不出条目，
+ * 所以要单独兜底；缺了它 gacha_id 会写空串，出图判 UP 和总览分组都会受影响。
+ */
+const STANDARD_GACHA_ID = '1001'
+
+/** 取某条记录该挂的 gacha_id：活动池走 pool_stat 的期次映射，常驻池用固定值 */
+function gachaOf(type, poolStat, itemId) {
+  const mapped = poolStat?.byUpItem?.get?.(String(itemId))
+  if (mapped) return mapped
+  return String(type) === '1' ? STANDARD_GACHA_ID : ''
+}
+
+/**
  * 把接口拿到的五星 + 垫抽并进本地某个池的记录。
  * 真实记录只增不删；占位每次重建，所以重复执行不会累加。
  */
 function mergePool(userId, uid, type, remote, poolStat) {
-  const local = readLocal(userId, uid, type)
+  const raw = readLocal(userId, uid, type)
+  /**
+   * ⚠️⚠️ 冗余 mini 必须在**这里**就清掉，不能只靠出图侧兜底。
+   * 本地已有同批次真实记录的 mini 是纯冗余，它留在数据里会连锁出错：
+   *   - localGap 多量一段 → 抽数口径错
+   *   - legacy 把它当成「还需要占位撑抽数」的锚点 → fillGap 又给它上方补一整批占位
+   * 实测光锥池那条冗余 mini 让「你将起身歌唱」凭空多出 54 条占位，68 抽显示成 122 抽。
+   * 放在读取处而不是写盘前，是因为下面每一段都依赖这份干净数据。
+   */
+  const local = dedupeMini(raw)
   const real = local.filter(r => !r.xhh_ph)
   const usedIds = new Set(real.map(r => String(r.id)))
 
@@ -517,7 +645,7 @@ function mergePool(userId, uid, type, remote, poolStat) {
   for (let i = 0; i < stars.length; i++) {
     const s = stars[i]
     const { hit } = anchors[i]
-    const gachaId = poolStat.byUpItem.get(String(s.item.item_id)) || ''
+    const gachaId = gachaOf(type, poolStat, s.item.item_id)
     finalCount[i] = Number(s.gacha_count) || 0
     if (hit) {
       skipped++
@@ -560,7 +688,7 @@ function mergePool(userId, uid, type, remote, poolStat) {
       name: s.item.name,
       count: finalCount[i],
       anchorId: anchors[i].anchorId,
-      gachaId: poolStat.byUpItem.get(String(s.item.item_id)) || '',
+      gachaId: gachaOf(type, poolStat, s.item.item_id),
       time: idToTime(s.id),
     })),
     ...legacy,
@@ -592,7 +720,10 @@ function mergePool(userId, uid, type, remote, poolStat) {
     }
   }
 
-  const changed = added.length > 0 || patched > 0 || local.length !== real.length
+  // 清掉冗余 mini（raw → local）本身就是变更，必须落盘，否则每次更新都白清一遍、
+  // 数据里那两条永远躺着。出图侧虽然也兜了一道，但写盘才是根治
+  const changed =
+    added.length > 0 || patched > 0 || local.length !== real.length || raw.length !== local.length
   if (changed) {
     const merged = [...added, ...real].sort((a, b) => {
       const x = big(a.id)
@@ -884,9 +1015,8 @@ async function prepareCookie(e, uid, user, { allowFix = false } = {}) {
 }
 
 
-/** 数字 gacha_type → 小程序里的池名 */
+/** 数字 gacha_type → 小程序里的池名（常驻池也在 POOLS 里，不用再手补一条） */
 const POOL_LABEL = Object.fromEntries(POOLS.map(p => [p.type, p.name]))
-POOL_LABEL['1'] = '常驻跃迁'
 
 /**
  * 从消息里的文件段拿下载直链。
@@ -1031,36 +1161,35 @@ function mergeImport(userId, uid, records) {
       if (r.id) ids.add(String(r.id))
     }
 
-    // 只有真的并进了新记录，才动本地：让同一个五星的小程序记录退位、顺带重建占位。
-    // 全是重复的时候一个字节都不改，免得白清掉占位丢了垫抽进度。
-    if (!add.length) {
-      stat.skipped += 0
-      continue
-    }
-
     // 顶替判据：b: key（item_id + id 前 10 位）精确，d: key（item_id + 日期）只作兜底。
+    //
+    // ⚠️ 判据来源必须**同时**包含「本地已有的非 mini 记录」和「本轮新增的记录」：
+    //   只看 add（原来那样）：真实记录一旦先落地（前一次更新/导入写过），这次它就被
+    //     ids 判重挡在 add 外，mini 永远等不到顶替者 —— 同一发五星在图上出现两次。
+    //     增量模式（full=false）的 floor 越过它、接口不再返回时也是同样结果。
+    //   只看 localNonMini：本轮新增的记录还没写进本地，也就顶不掉 mini。
+    // mini 记录存在的唯一意义就是「等着被真实记录顶替」，两边都要能当顶替者。
+    //
     // ⚠️ 用「计数」而不是 Set：Set 是命中即删，同日同名的两个五星（双黄、复刻连抽）
     // 会让 mini 的两条一起被删掉，而导入的只有一条 —— 少算一个五星。
     // 计数改成一对一消耗，来几条就顶掉几条。
     const coverCount = new Map()
     const bump = (k) => coverCount.set(k, (coverCount.get(k) || 0) + 1)
-    for (const r of add) {
-      bump(`b:${r.item_id}@${String(r.id).slice(0, 10)}`)
-      // 日期级 key 只在没有精确 b: 可用时才参与兜底，避免它把同名的另一条误吞
-      if (r.time) bump(`d:${r.item_id}@${String(r.time).slice(0, 10)}`)
-    }
-    let dropMini = 0
     // 顶替之前先把 mini 记录上的官方抽数（xhh_pity）交给接班的真实记录：
     // authkey 只给最近 6 个月，跨在截断边界上的那个五星本地间隔算不准，
     // 丢了这个字段就只能等下一次 *更新抽卡记录 才补回来
     const addFive = new Map()
-    for (const r of add) {
-      if (String(r.rank_type) !== '5') continue
+    for (const r of [...localNonMini, ...add]) {
       const bk = `b:${r.item_id}@${String(r.id).slice(0, 10)}`
       const dk = r.time ? `d:${r.item_id}@${String(r.time).slice(0, 10)}` : ''
+      bump(bk)
+      // 日期级 key 只在没有精确 b: 可用时才参与兜底，避免它把同名的另一条误吞
+      if (dk) bump(dk)
+      if (String(r.rank_type) !== '5') continue
       if (!addFive.has(bk)) addFive.set(bk, r)
       if (dk && !addFive.has(dk)) addFive.set(dk, r)
     }
+    let dropMini = 0
     const kept = localReal.filter(r => {
       if (r.xhh_src !== 'mini') return true
       // 小程序的 id 与游戏内导出前 10 位（批次时间戳）一致，Excel 的伪 id 只能按日期对。
@@ -1083,7 +1212,15 @@ function mergeImport(userId, uid, records) {
     // 只有当真实记录顶掉了小程序五星，占位才失去意义（它们是挂在那些五星上的）；
     // 否则原样留着，别让一次小规模导入把垫抽进度清光
     const phKept = dropMini ? [] : local.filter(r => r.xhh_ph)
-    writeLocal(userId, uid, type, [...add, ...kept, ...phKept].sort(byIdDesc))
+    // 本轮什么都没变时一个字节都不改：免得白清掉占位丢了垫抽进度。
+    // （add 为空但仍要落盘的唯一情形是 dropMini>0 —— 清 mini 记录本身就是变更）
+    if (!add.length && !dropMini) {
+      stat.skipped += 0
+      continue
+    }
+    // 落盘前再兜一道：本地已有同批次真实记录的 mini 一并清掉（含它名下的占位）。
+    // 正常情况 kept 那步已经顶掉了，这里防的是「顶替判据没覆盖到的边角」
+    writeLocal(userId, uid, type, dedupeMini([...add, ...kept, ...phKept].sort(byIdDesc)))
     stat.added += add.length
     stat.dropPh += dropMini ? dropPh : 0
     stat.dropMini += dropMini
@@ -1168,7 +1305,7 @@ function lazyGachaCookie(e, uid) {
 /** 出图前顺手把当前池的垫抽刷新一下（缓存超过 10 分钟才动，失败就沿用旧值） */
 async function refreshPity(e, uid, type, getCookie) {
   const pool = POOLS.find(p => p.type === String(type))
-  if (!pool) return // 常驻池接口不给，本地算得出来
+  if (!pool) return
   const entry = readPoolCache()[String(uid)]?.[String(type)]
   if (entry?.at && Date.now() - entry.at < 10 * 60 * 1000) return
   try {
@@ -1261,6 +1398,8 @@ async function buildAllViewData(e, uid) {
   const upMap = upMapFromCache()
   // 也共用一次登录：真有池要刷垫抽时才会去换凭证
   const getCookie = lazyGachaCookie(e, uid)
+  // 总览图的池子顺序是显式写死的（活动池在前、常驻靠后，跟小程序观感一致），
+  // 不是按 POOLS 表顺序 —— 以后 POOLS 里加了新池，这里要跟着补一个 type
   for (const type of ['11', '12', '21', '22', '1', '2']) {
     const list = readLocalForView(e.user_id, uid, type)
     if (!list.length) continue
@@ -1413,7 +1552,8 @@ async function fetchAllByAuthkey(params, userId, { full = false, onPool } = {}) 
   let uid = ''
   let stopId = new Map()
   try {
-    for (const pool of [...POOLS.map(p => p.type), '1']) {
+    // 池名全部走 POOLS：常驻池（type 1）已经在表里，别再手写一遍，会重复拉
+    for (const pool of POOLS.map(p => p.type)) {
       let endId = '0'
       let got = 0
       let reachedOld = false
@@ -1567,8 +1707,7 @@ export class srGachaLog extends plugin {
       { at: true },
     )
 
-    // 第一次导入（本地一条记录都没有）出总览图，之后照旧出单池图
-    const first = !hasLocalRecords(this.e.user_id, linkUid)
+    // 拉完直接出总览图（每个池一块）
     try {
       const perPool = []
       const { records } = await fetchAllByAuthkey(params, this.e.user_id, {
@@ -1578,7 +1717,7 @@ export class srGachaLog extends plugin {
       const uid = linkUid
       if (!records.length) {
         await this.reply('拉完了，没有新记录', false, { at: true })
-        await (first ? this.renderAll(uid) : this.renderMini(uid))
+        await this.renderAll(uid)
         return true
       }
 
@@ -1593,7 +1732,7 @@ export class srGachaLog extends plugin {
           `（${perPool.join('、')}）`,
       )
       await this.reply(`更新完成，新增 ${stat.added} 条${recall}`, false, { at: true })
-      await (first ? this.renderAll(uid) : this.renderMini(uid))
+      await this.renderAll(uid)
     } catch (err) {
       logger?.error?.(`[xhh-TL][抽卡记录] 链接拉取失败：${err.stack || err.message}`)
       // 中断前已经翻到的记录先存下来，下次发链接会从这里接着拉
@@ -1707,11 +1846,26 @@ export class srGachaLog extends plugin {
       // 绑的 UID 可能跟米游社对不上，这里拿到的才是真正要用的号
       const { cookie, region, uid: realUid } = await prepareCookie(this.e, uid, user, { allowFix: true })
       const gachaCookie = await badgeLogin(cookie, realUid, region)
-      // 第一次更新（本地一条记录都没有）出总览图，让人一眼看到所有池；之后照旧出单池图
-      const first = !hasLocalRecords(this.e.user_id, realUid)
-      // 更新完不发文案，统计只落日志，直接出图
-      logger?.info?.(`[xhh-TL][抽卡记录] ${realUid} ${await this.runUpdate(realUid, gachaCookie)}`)
-      await (first ? this.renderAll(realUid) : this.renderMini(realUid))
+      // 更新完先回一条只列变动池的文字，再出总览图（每个池一块，一眼看完）
+      const { log, pools } = await this.runUpdate(realUid, gachaCookie)
+      logger?.info?.(`[xhh-TL][抽卡记录] ${realUid} ${log}`)
+      const changed = pools.filter(p => p.changed)
+      // 一个池都没变动就不发文字，只出图
+      if (changed.length) {
+        await this.reply(
+          [
+            '崩铁抽卡记录更新完成',
+            `UID：${realUid}`,
+            `合计新增五星 ${pools.reduce((n, p) => n + p.added5, 0)} 条`,
+            ...changed.map(
+              p => `${p.name}：新增五星 ${p.added5} 条，本地共 ${p.total} 条，当前垫抽 ${p.pity} 抽`,
+            ),
+          ].join('\n'),
+          false,
+          { at: true },
+        )
+      }
+      await this.renderAll(realUid)
     } catch (err) {
       logger?.error?.(`[xhh-TL][抽卡记录] ${uid} 更新失败：${err.stack || err.message}`)
       await this.reply(`崩铁抽卡记录更新失败，请稍后重试`, false, { at: true })
@@ -1850,37 +2004,66 @@ export class srGachaLog extends plugin {
     return true
   }
 
-  /** 逐池拉取 → 合并 → 组装汇总文案 */
+  /** 逐池拉取 → 合并 → 汇总。返回值里 log 进日志，pools 供更新完的文字汇报用 */
   async runUpdate(uid, gachaCookie) {
     const userId = this.e.user_id
     const lines = []
     const pityParts = []
     const notes = []
+    const pools = []
     let added5 = 0
     let addedPh = 0
     let skipped = 0
     let patchedTotal = 0
     let remoteTotal = 0
+    let failed = 0
 
     for (const pool of POOLS) {
-      const remote = await fetchFiveStars(gachaCookie, pool.key)
-      const poolStat = await fetchPoolStat(gachaCookie, pool.key)
-      savePoolCache(uid, pool.type, poolStat.cards, remote.pity)
-      const res = mergePool(userId, uid, pool.type, remote, poolStat)
+      // ⚠️ 单池失败不能拖垮整轮：这套接口会限流（实测短时间连打十来个请求就回 -100），
+      // 六个池每轮十几个请求，最后几个池踩到限流是常态。原来这里直接往外抛，
+      // 表现是「前面几个池更新好了、后面的池纹丝不动」，用户还以为整轮成功了。
+      // 现在按池兜住，失败只记一笔，其余池照常合并，全挂才对外报错。
+      try {
+        const remote = await fetchFiveStars(gachaCookie, pool.key)
+        const poolStat = await fetchPoolStat(gachaCookie, pool.key)
+        // 垫抽有没有变，要在写缓存**之前**取旧值比
+        const prevPity = cachedPity(uid, pool.type)
+        savePoolCache(uid, pool.type, poolStat.cards, remote.pity)
+        const res = mergePool(userId, uid, pool.type, remote, poolStat)
 
-      added5 += res.added5
-      addedPh += res.addedPh
-      skipped += res.skipped
-      patchedTotal += res.patched || 0
-      remoteTotal += remote.list.length
-      notes.push(...res.notes)
-      if (remote.pity > 0) pityParts.push(`${pool.name}${remote.pity}抽`)
-      lines.push(`${pool.name} 五星${remote.list.length}条`)
+        added5 += res.added5
+        addedPh += res.addedPh
+        skipped += res.skipped
+        patchedTotal += res.patched || 0
+        remoteTotal += remote.list.length
+        notes.push(...res.notes)
+        if (remote.pity > 0) pityParts.push(`${pool.name}${remote.pity}抽`)
+        lines.push(`${pool.name} 五星${remote.list.length}条`)
+        pools.push({
+          name: pool.name,
+          added5: res.added5,
+          total: res.total,
+          pity: remote.pity,
+          // 「有变动」的判据不能直接用 res.changed —— 占位每轮全清重建，
+          // 那个标志几乎恒为 true，六个池会全被列出来，等于没过滤。
+          // 只认出图里看得见的变化：新增五星 / 补齐接口抽数 / 垫抽数变了
+          changed: res.added5 > 0 || (res.patched || 0) > 0 || remote.pity !== prevPity,
+        })
+      } catch (err) {
+        failed++
+        notes.push(`${pool.name}拉取失败`)
+        logger?.warn?.(`[xhh-TL][抽卡记录] ${pool.name} 拉取失败：${err.message}`)
+      }
       await sleep(400)
     }
 
-    // 结果直接出图，这段只进日志，方便回查合并细节
-    return [
+    // 一个池都没成，说明凭证或接口整体不通，交给上层报错（别再出一张空图）
+    if (failed === POOLS.length) {
+      throw new Error(`所有卡池都拉取失败：${notes.filter(n => n.endsWith('拉取失败')).join('、')}`)
+    }
+
+    // 明细只进日志，方便回查合并细节；pools 交给上层拼「更新完成」那条文字
+    const log = [
       `新增五星 ${added5} 条（接口给出 ${remoteTotal} 条，${skipped} 条本地已有）`,
       `占位 ${addedPh} 条`,
       patchedTotal ? `补齐 ${patchedTotal} 条记录的接口抽数` : '',
@@ -1890,6 +2073,7 @@ export class srGachaLog extends plugin {
     ]
       .filter(Boolean)
       .join('；')
+    return { log, pools, failed }
   }
 }
 
